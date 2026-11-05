@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phone to TV</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  #screen { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; }
+  #overlay { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; background: rgba(0,0,0,.85); text-align: center; padding: 24px; box-sizing: border-box; }
+  #overlay h1 { font-size: 48px; margin: 0 0 16px; }
+  #overlay p { font-size: 24px; margin: 8px 0; color: #ccc; }
+  #start { margin-top: 32px; font-size: 32px; padding: 20px 48px; border: 0; border-radius: 16px;
+    background: #2f7cf6; color: #fff; cursor: pointer; }
+  #start:focus { outline: 4px solid #fff; outline-offset: 4px; }
+  #status { position: absolute; left: 16px; bottom: 16px; font-size: 18px; padding: 8px 14px;
+    background: rgba(0,0,0,.6); border-radius: 8px; transition: opacity .6s; pointer-events: none; }
+  .hidden { display: none !important; }
+  .faded { opacity: 0; }
+</style>
+</head>
+<body>
+<canvas id="screen"></canvas>
+<div id="overlay">
+  <h1>Phone to TV</h1>
+  <p>Ready to show your phone on this screen.</p>
+  <p>Press <b>OK</b> on your remote or click the button to start (this turns the sound on).</p>
+  <button id="start" autofocus>Start</button>
+</div>
+<div id="status">Connecting…</div>
+<script>
+(function () {
+  var canvas = document.getElementById('screen');
+  var ctx2d = canvas.getContext('2d');
+  var overlay = document.getElementById('overlay');
+  var statusEl = document.getElementById('status');
+  var startBtn = document.getElementById('start');
+
+  var sampleRate = 48000, channels = 2;
+  var audioCtx = null, nextTime = 0;
+  var TARGET_LATENCY = 0.12;  // seconds of audio buffered ahead
+  var MAX_LATENCY = 0.40;     // if we fall further behind than this, drop audio to catch up
+
+  var decoding = false, pendingFrame = null;
+  var frames = 0, lastStatsTime = Date.now(), connected = false, statusTimer = null;
+
+  function setStatus(text, sticky) {
+    statusEl.textContent = text;
+    statusEl.className = '';
+    clearTimeout(statusTimer);
+    if (!sticky) statusTimer = setTimeout(function () { statusEl.className = 'faded'; }, 3000);
+  }
+
+  // ------------------------------------------------------------ video
+  function showFrame(buf) {
+    if (decoding) { pendingFrame = buf; return; } // keep only newest frame
+    decoding = true;
+    var blob = new Blob([new Uint8Array(buf, 1)], { type: 'image/jpeg' });
+    var done = function () {
+      decoding = false;
+      frames++;
+      if (pendingFrame) { var p = pendingFrame; pendingFrame = null; showFrame(p); }
+    };
+    if (window.createImageBitmap) {
+      createImageBitmap(blob).then(function (bmp) {
+        draw(bmp, bmp.width, bmp.height);
+        if (bmp.close) bmp.close();
+        done();
+      }, done);
+    } else {
+      var url = URL.createObjectURL(blob);
+      var img = new Image();
+      img.onload = function () { draw(img, img.naturalWidth, img.naturalHeight); URL.revokeObjectURL(url); done(); };
+      img.onerror = function () { URL.revokeObjectURL(url); done(); };
+      img.src = url;
+    }
+  }
+
+  function draw(src, w, h) {
+    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+    ctx2d.drawImage(src, 0, 0);
+  }
+
+  // ------------------------------------------------------------ audio
+  function initAudio() {
+    if (audioCtx) return;
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) { setStatus('This browser cannot play sound', true); return; }
+    try { audioCtx = new AC({ sampleRate: sampleRate, latencyHint: 'interactive' }); }
+    catch (e) { audioCtx = new AC(); }
+    if (audioCtx.resume) audioCtx.resume();
+  }
+
+  function playAudio(buf) {
+    if (!audioCtx || audioCtx.state === 'suspended') return;
+    var pcm = new Int16Array(buf.slice(1));
+    var frameCount = Math.floor(pcm.length / channels);
+    if (!frameCount) return;
+    var now = audioCtx.currentTime;
+    if (nextTime < now + 0.02) nextTime = now + TARGET_LATENCY;  // underrun: rebuffer
+    if (nextTime > now + MAX_LATENCY) return;                    // too far behind: drop
+    var ab = audioCtx.createBuffer(channels, frameCount, sampleRate);
+    for (var c = 0; c < channels; c++) {
+      var out = ab.getChannelData(c);
+      for (var i = 0, j = c; i < frameCount; i++, j += channels) out[i] = pcm[j] / 32768;
+    }
+    var srcNode = audioCtx.createBufferSource();
+    srcNode.buffer = ab;
+    srcNode.connect(audioCtx.destination);
+    srcNode.start(nextTime);
+    nextTime += frameCount / sampleRate;
+  }
+
+  // -------------------------------------------------------- websocket
+  function connect() {
+    var ws = new WebSocket('ws://' + location.host + '/ws');
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = function () { connected = true; setStatus('Connected'); };
+    ws.onmessage = function (ev) {
+      if (typeof ev.data === 'string') {
+        try {
+          var cfg = JSON.parse(ev.data);
+          if (cfg.sampleRate) sampleRate = cfg.sampleRate;
+          if (cfg.channels) channels = cfg.channels;
+          if (cfg.message) setStatus(cfg.message);
+        } catch (e) {}
+        return;
+      }
+      var type = new Uint8Array(ev.data, 0, 1)[0];
+      if (type === 1) showFrame(ev.data);
+      else if (type === 2) playAudio(ev.data);
+    };
+    ws.onclose = function () {
+      if (connected) setStatus('Disconnected — reconnecting…', true);
+      connected = false;
+      setTimeout(connect, 1500);
+    };
+    ws.onerror = function () { try { ws.close(); } catch (e) {} };
+  }
+
+  function start() {
+    overlay.className = 'hidden';
+    initAudio();
+    var el = document.documentElement;
+    var fs = el.requestFullscreen || el.webkitRequestFullscreen;
+    if (fs) { try { var p = fs.call(el); if (p && p.catch) p.catch(function () {}); } catch (e) {} }
+  }
+
+  startBtn.onclick = start;
+  document.addEventListener('keydown', function (e) {
+    if (!overlay.className && (e.key === 'Enter' || e.keyCode === 13)) { start(); e.preventDefault(); }
+  });
+  // Clicking the picture later re-enables sound if the browser suspended it.
+  canvas.onclick = function () { if (audioCtx && audioCtx.resume) audioCtx.resume(); };
+
+  setInterval(function () {
+    var t = Date.now();
+    var fps = Math.round(frames * 1000 / (t - lastStatsTime));
+    frames = 0; lastStatsTime = t;
+    window.__castFps = fps;
+  }, 1000);
+
+  connect();
+})();
+</script>
+</body>
+</html>
